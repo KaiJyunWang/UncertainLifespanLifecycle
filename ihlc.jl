@@ -43,7 +43,7 @@ die = zeros(Bool, N, periods)
 health = zeros(Union{Missing, Int64}, N, periods)
 
 s = fill(s, length(gm1.dp))
-gm0_ex = vcat(gm0.dp,zeros(length(gm1.dp)-length(gm0.dp)))
+gm0_ex = vcat(gm0.dp,ones(length(gm1.dp)-length(gm0.dp)))
 for a in 2:length(s)
     s[a] = s[a-1]*(1-gm1.dp[a-1])/(s[a-1]*(1-gm1.dp[a-1])+(1-s[a-1])*(1-gm0_ex[a-1]))
 end
@@ -150,6 +150,7 @@ plot!(65:99,s[65:99],label = L"s")
 #model solver
 gm0_aug = zeros(size(gm1.dist))
 gm0_aug[1:gm0.ceiling+1, 1:gm0.ceiling+1] = gm0.dist
+gm0_aug[1,gm0.ceiling+1:end-1] .= 1.0
 
 ihlc = @with_kw (γ = 0.7, μ_y = 5.0, s_y = 0.3, ε_y = s_y*randn(250), r = 0.02, 
                 α = 5.0, β = 0.95, κ = 10.0, δ = 0.5, gm0 = gm0, gm1 = gm1, 
@@ -162,6 +163,7 @@ function backward_solve(ihlc)
     life_ceil = max(gm0.ceiling, gm1.ceiling)+1
     gm0_aug = zeros(size(gm1.dist))
     gm0_aug[1:gm0.ceiling+1, 1:gm0.ceiling+1] = gm0.dist
+    gm0_aug[1,gm0.ceiling+1:end-1] .= 1.0
     H0(a, ph) = cdf(Logistic(), β_H0[1] + β_H0[2]*a + β_H0[3]*(ph==1))
     H1(a, ph) = cdf(Logistic(), β_H1[1] + β_H1[2]*a + β_H1[3]*(ph==1))
 
@@ -172,7 +174,7 @@ function backward_solve(ihlc)
     a = 65:life_ceil
     s = 0.0:0.05:1.0
     #utility functions
-    u(c) = (c>0 ? (γ!=1 ? c^(1-γ)/(1-γ) : log(c)) : -1e10)
+    u(c) = (c>0 ? (γ!=1 ? c^(1-γ)/(1-γ) : log(c)) : -1e30)
     φ(b) = (b>-κ ? (γ!=1 ? α*(1+b/κ)^(1-γ)/(1-γ) : α*log(1+b/κ)) : -1e10)
     #die dist.
     dp1 = CuArray(gm1.dist[1:length(a),65:end])
@@ -188,7 +190,8 @@ function backward_solve(ihlc)
     @tullio H[p,l,2,n] = 1-H[p,l,1,n]
     #backward
     policy = zeros(length(y), length(b), length(h), length(a), length(s))
-    v = zeros(size(policy))
+    v = zeros(size(policy)) 
+    
     ind = zeros(Int64, length(y), length(b), length(h), length(s))
     v_candi = zeros(length(y), length(b), length(b), length(h), length(s)) |> x -> CuArray(x)
     #for speed
@@ -204,19 +207,20 @@ function backward_solve(ihlc)
     @tullio v2[i,j,k,l] = v1[i,j,k]*h[l] #health depreciation on consumption utility
     @tullio v3[k,n,p] = $β*dist[p,1,n]*φ(b[k]*(1+$r)) #beuest
     @tullio v4[p,l,m,n] = (m == 1 ? s[p]*H1(a[n],l)/H[p,l,m,n] : s[p]*(1-H1(a[n],l))/H[p,l,m,n]) #health update
-    @tullio v5[p,l,m,n] = min((dp1[1,n] != 1.0 ? (v4[p,l,m,n] != 0.0 ? v4[p,l,m,n]*(1-dp1[1,n])/(v4[p,l,m,n]*(1-dp1[1,n])+(1-v4[p,l,m,n])*(1-dp0[1,n])) : 0.0) : 1.0),1.0) #death update
+    @tullio v5[p,l,m,n] = min((dp0[1,n] != 1.0 ? v4[p,l,m,n]*(1-dp1[1,n])/(v4[p,l,m,n]*(1-dp1[1,n])+(1-v4[p,l,m,n])*(1-dp0[1,n])) : 1.0), 1.0) #death update
+    
     #NPSC
-    r_seq = [(1/(1+r))^t for t in 1:length(a)-1]
-    @tullio comp[p,n] := dist[p,o+1,n]*r_seq[o]
+    r_seq = [1-(1/(1+r))^t for t in 1:length(a)]
+    @tullio comp[p,n] := dist[p,o+1,n]*r_seq[o] (o in 1:length(a)-1)
     NPSC = zeros(length(b), length(s), length(a)) |> x -> CuArray(x)
-    @tullio NPSC[k,p,n] = (b[k]- $μ_y/$r)*dist[p,1,n] + $μ_y/$r*(1-comp[p,n])
-
+    @tullio NPSC[k,p,n] = b[k]*dist[p,1,n] + $μ_y/$r*comp[p,n]
+    
     for N in 1:length(a)-1
         n = length(a)-N
         v_func = LinearInterpolation((y,b,h,s), v[:,:,:,n+1,:])
         @tullio v6[k,l,m,p] = mean(v_func(μ_y.+ε_y,b[k],h[m],v5[p,l,m,$n]))
         @tullio v7[k,l,p] = v6[k,l,m,p]*H[p,l,m,$n]
-        @tullio v_candi[i,j,k,l,p] = (v2[i,j,k,l] + v3[k,$n,p] + $β*(1-dist[p,1,$n])*v7[k,l,p])
+        @tullio v_candi[i,j,k,l,p] = (NPSC[k,p,$n] ≥ 0.0 ? v2[i,j,k,l] + v3[k,$n,p] + $β*(1-dist[p,1,$n])*v7[k,l,p] : -1e10)
         #findmax
         v_can = Array(v_candi)
         @tullio W[i, j, l, p] := findmax(v_can[i, j, :, l, p])
@@ -224,12 +228,16 @@ function backward_solve(ihlc)
         @tullio ind[i, j, l, p] = W[i, j, l, p][2]
         @tullio policy[i, j, l, $n, p] = b[ind[i, j, l, p]]
     end 
-    return (v = v, σ = policy, NPSC = NPSC)
+    return (v = v, σ = policy, NPSC = NPSC, D = dist)
 end
 
 sol = backward_solve(ihlc)
 npsc = Array(sol.NPSC)
-plot(npsc[:,21,35])
+findall(x -> (x ≈ 1.0), sum(sol.D, dims = 2))#dist need to be adjusted
+heatmap(sol.σ[:,:,1,22,end])
+heatmap(Array(sol.D)[:,:,1])
+heatmap(sign.(npsc[:,:,24]))
+
 y = ihlc.μ_y .+ ihlc.s_y*randn(ihlc.gm1.ceiling-64)
 y = fill(ihlc.μ_y,ihlc.gm1.ceiling-64)
 bon = zeros(ihlc.gm1.ceiling-63)
@@ -246,7 +254,7 @@ s = fill(0.3,ihlc.gm1.ceiling-63)
 for t in 1:ihlc.gm1.ceiling-64
     bon[t+1] = σ_func(y[t], bon[t], h[t], 64+t, s[t])
     s[t+1] = (h[t] == 0 ? s[t]*H1(64+t,h[t])/(s[t]*H1(64+t,h[t])+(1-s[t])*H0(64+t,h[t])) : s[t]*(1-H1(64+t,h[t]))/(s[t]*(1-H1(64+t,h[t]))+(1-s[t])*(1-H0(64+t,h[t]))))
-    s[t+1] = (t+64 < ihlc.gm0.ceiling ? s[t+1]*(1-ihlc.gm1.dp[64+t])/(s[t+1]*(1-ihlc.gm1.dp[64+t])+(1-s[t+1])*(1-ihlc.gm0.dp[64+t])) : 1.0)
+    s[t+1] = (ihlc.gm1.dp[64+t] != 1 ? s[t+1]*(1-ihlc.gm1.dp[64+t])/(s[t+1]*(1-ihlc.gm1.dp[64+t])+(1-s[t+1])*(1-gm0_ex[64+t])) : 1.0)
 end
 con = y + (1+ihlc.r)*bon[1:end-1] - bon[2:end]
 
