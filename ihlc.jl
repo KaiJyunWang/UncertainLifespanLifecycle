@@ -220,7 +220,7 @@ function backward_solve(ihlc)
         v_func = LinearInterpolation((y,b,h,s), v[:,:,:,n+1,:])
         @tullio v6[k,l,m,p] = mean(v_func(μ_y.+ε_y,b[k],h[m],v5[p,l,m,$n]))
         @tullio v7[k,l,p] = v6[k,l,m,p]*H[p,l,m,$n]
-        @tullio v_candi[i,j,k,l,p] = (NPSC[k,p,$n] ≥ 0.0 ? v2[i,j,k,l] + v3[k,$n,p] + $β*(1-dist[p,1,$n])*v7[k,l,p] : -1e10)
+        @tullio v_candi[i,j,k,l,p] = (NPSC[k,p,$n] ≥ 0.0 ? v2[i,j,k,l] + v3[k,$n,p] + $β*(1-dist[p,1,$n])*v7[k,l,p] : -1e100)
         #findmax
         v_can = Array(v_candi)
         @tullio W[i, j, l, p] := findmax(v_can[i, j, :, l, p])
@@ -251,17 +251,23 @@ s = fill(0.3,ihlc.gm1.ceiling-63)
 σ_func = LinearInterpolation((range(ihlc.μ_y+minimum(ihlc.ε_y), ihlc.μ_y+maximum(ihlc.ε_y), length = 21),
                                 range(-ihlc.κ+1e-5, ihlc.μ_y*(1+ihlc.r)/ihlc.r, 51), 0:1, 65:ihlc.gm1.ceiling+1,
                                 0.0:0.05:1.0), sol.σ)
+v_func = LinearInterpolation((range(ihlc.μ_y+minimum(ihlc.ε_y), ihlc.μ_y+maximum(ihlc.ε_y), length = 21),
+range(-ihlc.κ+1e-5, ihlc.μ_y*(1+ihlc.r)/ihlc.r, 51), 0:1, 65:ihlc.gm1.ceiling+1,
+0.0:0.05:1.0), sol.v)
+v_func(y[1],0,1,65,0.3)
+v_func(y[35],-9,0,86,0.1)
 for t in 1:ihlc.gm1.ceiling-64
     bon[t+1] = σ_func(y[t], bon[t], h[t], 64+t, s[t])
     s[t+1] = (h[t] == 0 ? s[t]*H1(64+t,h[t])/(s[t]*H1(64+t,h[t])+(1-s[t])*H0(64+t,h[t])) : s[t]*(1-H1(64+t,h[t]))/(s[t]*(1-H1(64+t,h[t]))+(1-s[t])*(1-H0(64+t,h[t]))))
     s[t+1] = (ihlc.gm1.dp[64+t] != 1 ? s[t+1]*(1-ihlc.gm1.dp[64+t])/(s[t+1]*(1-ihlc.gm1.dp[64+t])+(1-s[t+1])*(1-gm0_ex[64+t])) : 1.0)
 end
 con = y + (1+ihlc.r)*bon[1:end-1] - bon[2:end]
+D_func = LinearInterpolation((0.0:0.05:1.0,1:ihlc.gm1.ceiling-63,65:ihlc.gm1.ceiling+1),sol.D)
 
 plt = plot(65:ihlc.gm1.ceiling, y, label = L"y", legend = :topleft)
 plot!(65:ihlc.gm1.ceiling, bon[2:end], label = L"b")
 plot!(65:ihlc.gm1.ceiling, con, label = L"c")
-plot!(twinx(), 65:ihlc.gm1.ceiling, s[1:end-1], label = L"s", legend = :topright, color = :black)
+plot!(twinx(), 65:ihlc.gm1.ceiling, [s[1:end-1],x -> D_func(s[x-64],1,x)], label = [L"s" L"dp"] , legend = :topright, color = [:black :brown])
 vspan!(vcat(64 .+ findall(x -> x != 0, h[1:end-1]-h[2:end]),ihlc.gm1.ceiling).+ 0.5, 
         color = :gray, alpha = :0.4, label = "")
 
