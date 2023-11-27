@@ -35,22 +35,22 @@ plot!(65:99, x -> cdf(Logistic(), -36.0+0.5*x))
 #simulation parameters
 N = 10000
 periods = 10
-#type percentage (real prior for being helthy)
-s = 0.3
+
 type = zeros(Bool, N)
 ages = zeros(Int64, N, periods)
 die = zeros(Bool, N, periods)
 health = zeros(Union{Missing, Int64}, N, periods)
 
-s = fill(s, length(gm1.dp))
+#type percentage (real prior for being helthy)
+s = fill(0.3, length(gm1.dp)-64)
 gm0_ex = vcat(gm0.dp,ones(length(gm1.dp)-length(gm0.dp)))
 for a in 2:length(s)
-    s[a] = s[a-1]*(1-gm1.dp[a-1])/(s[a-1]*(1-gm1.dp[a-1])+(1-s[a-1])*(1-gm0_ex[a-1]))
+    s[a] = (gm0_ex[a+63] != 1.0 ? s[a-1]*(1-gm1.dp[a+63])/(s[a-1]*(1-gm1.dp[a+63])+(1-s[a-1])*(1-gm0_ex[a+63])) : 1.0)
 end
 #assume that the age dist. is DiscreteUniform -- does not really matter.
 @tullio ages[i,1] = rand(DiscreteUniform(65, $gm1.ceiling))
 #0:unhealthy 1:healthy
-@tullio type[i] = rand(Bernoulli(s[ages[i,1]]))
+type = rand.(Bernoulli.(s[ages[:,1].-64]))
 for j in 2:periods
     ages[:,j] = ages[:,j-1] .+ 1
 end
@@ -88,7 +88,6 @@ df = DataFrame(id = vec(repeat(transpose(collect(1:N)),periods)),
 #s1 = x[11] :type healthy
 df_h = filter(row -> !ismissing(row.health), df)
 
-df_h[df_h.time .!= 10, :health]
 pre_h = zeros(Union{Missing, Int64}, nrow(df_h))
 for i in 1:nrow(df_h) 
     pre_h[i] = (df_h.time[i] != 1 ? df_h[i-1,:health] : missing)
@@ -98,39 +97,44 @@ ldf_h = dropmissing(df_h)
 #simulated prior
 #MLE in first stage
 #adjust to logit
+#x[1:3]: type 0 Mortality
+#x[4:5]: type 1 Mortality (θ_13 = x[3])
+#x[6:8]: type 0 Health transition logit
+#x[9:11]: type 1 Health transition logit
+#x[12]: age 65 type 1 proportion
 function L_fs(x)
-    
-    if  prod((x .> 0) .* (x .< 1))*(real(log(complex((1-x[3])/x[4])))/x[5]+1 ≥ maximum(df_h.age)) == 1
-        μ0(a) = min(x[1]*exp(x[2]*a)+x[3],1.0)
-        μ1(a) = min(x[4]*exp(x[5]*a)+x[3],1.0)
-        H_0 = [x[6] 1-x[6] ;x[7] 1-x[7]]
-        H_1 = [x[8] 1-x[8] ;x[9] 1-x[9]]
-        #adjust time by ourselves
-        s = fill(x[10], maximum(df_h.age))
-        for a in 2:maximum(df_h.age)
-            s[a] = s[a-1]*(1-μ1(a-1))/(s[a-1]*(1-μ1(a-1))+(1-s[a-1])*(1-μ0(a-1)))
-        end
-        @tullio H[a,l,m] := s[a]*H_1[l,m]+(1-s[a])*H_1[l,m]
-        
-        @tullio l_μ[i] := logpdf(Bernoulli(s[df_h.age[i]]*μ1(df_h.age[i])+(1-s[df_h.age[i]])*μ0(df_h.age[i])),df_h.die[i])
-        @tullio l_h[i] := log(H[ldf_h.age[i],ldf_h.pre_health[i],ldf_h.health[i]])
-
-        return sum(l_μ)+sum(l_h)
-    else
-        return -1e100*sum(abs.(x))
+    μ0(a) = min(x[1]*exp(x[2]*a)+x[3],1.0)
+    μ1(a) = min(x[4]*exp(x[5]*a)+x[3],1.0)
+    H0(a, ph) = cdf(Logistic(), x[6]+x[7]*a+x[8]*(ph==0))
+    H1(a, ph) = cdf(Logistic(), x[9]+x[10]*a+x[11]*(ph==0))
+    #adjust time by ourselves
+    s = fill(x[12], maximum(df_h.age)-64)
+    for a in 2:length(s)
+        s[a] = s[a-1]*(1-μ1(a+63))/(s[a-1]*(1-μ1(a+63))+(1-s[a-1])*(1-μ0(a+63)))
     end
+    #need some speed here
+    loglikelihood = 0
+    for i in 1:length(df_h.id)
+        loglikelihood = loglikelihood + ((s[df_h.age[i]-64]*μ1(df_h.age[i])+(1-s[df_h.age[i]-64])*μ0(df_h.age[i]) < 1.0) && (s[df_h.age[i]-64]*μ1(df_h.age[i])+(1-s[df_h.age[i]-64])*μ0(df_h.age[i]) > 0.0) ? log(s[df_h.age[i]-64]*μ1(df_h.age[i])+(1-s[df_h.age[i]-64])*μ0(df_h.age[i]))*df_h.die[i]+log(1-(s[df_h.age[i]-64]*μ1(df_h.age[i])+(1-s[df_h.age[i]-64])*μ0(df_h.age[i])))*(1-df_h.die[i]) : -1e20)
+    end
+    
+    for i in 1:length(ldf_h.id)
+        loglikelihood = loglikelihood + ((s[ldf_h.age[i]-64]*H1(ldf_h.age[i],ldf_h.pre_health[i])+(1-s[ldf_h.age[i]-64])*H0(ldf_h.age[i],ldf_h.pre_health[i]) < 1.0) && (s[ldf_h.age[i]-64]*H1(ldf_h.age[i],ldf_h.pre_health[i])+(1-s[ldf_h.age[i]-64])*H0(ldf_h.age[i],ldf_h.pre_health[i]) > 0.0) ? log(s[ldf_h.age[i]-64]*H1(ldf_h.age[i],ldf_h.pre_health[i])+(1-s[ldf_h.age[i]-64])*H0(ldf_h.age[i],ldf_h.pre_health[i]))*(1-ldf_h.health[i])+log(1-(s[ldf_h.age[i]-64]*H1(ldf_h.age[i],ldf_h.pre_health[i])+(1-s[ldf_h.age[i]-64])*H0(ldf_h.age[i],ldf_h.pre_health[i])))*ldf_h.health[i] : -1e20)
+    end
+    
+    return loglikelihood
 end
-
+L_fs(0.001*ones(12))
 plot(65:99, s[65:end])
 
-L_fs([0.002,0.075,0.001,0.001,0.07,0.7,0.4,0.3,0.1,0.3])
-res_mle_fs = optimize(x -> -L_fs(x), 0.1*ones(10)) 
+
+res_mle_fs = optimize(x -> -L_fs(x), 0.001*ones(12)) 
 println(res_mle_fs.minimizer)
 L_fs(res_mle_fs.minimizer)
 x̂ = res_mle_fs.minimizer
 #may be the problem of likelihood functions
 gm0_mle = gm(res_mle_fs.minimizer[1:3])
-gm1_mle = gm([res_mle_fs.minimizer[4],res_mle_fs.minimizer[5],res_mle_fs.minimizer[3]])
+gm1_mle1 = gm([res_mle_fs.minimizer[4],res_mle_fs.minimizer[5],res_mle_fs.minimizer[3]])
 
 ForwardDiff.gradient(L_fs,[0.002,0.075,0.001,0.001,0.07,0.7,0.4,0.3,0.1,0.3])
 ForwardDiff.gradient(L_fs,res_mle_fs.minimizer)
