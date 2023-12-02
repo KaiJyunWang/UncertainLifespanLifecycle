@@ -81,20 +81,98 @@ end
 
 df = DataFrame(id = vec(repeat(transpose(collect(1:N)),periods)), 
                 time = repeat(collect(1:10),N), age = vec(transpose(ages)),
-                die = vec(transpose(die)), health = vec(transpose(health)))
+                die = vec(transpose(die)), health = (vec(transpose(health)) .== 1))
 
 #μ0 = x[1]*exp(x[2]*t)+x[3]; μ1 = x[4]*exp(x[5]*t)+x[6]
 #H_1 = [x[7], x[8];1-x[7], 1-x[8]]; ht2 = [x[9], x[10];1-x[9]x[10],1-x[10]]
 #s1 = x[11] :type healthy
 df_h = filter(row -> !ismissing(row.health), df)
-
+dt = combine(groupby(df_h, :id), nrow, :health => mean)
+health_prob = zeros(nrow(df_h))
+step = 1
+for i in 1:nrow(dt)
+    h_prob = fill(dt.health_mean[i],dt.nrow[i])
+    health_prob[step:step + dt.nrow[i]-1] = h_prob
+    step = step + dt.nrow[i]
+end
+df_h[!,:h_prob] = health_prob
+#should depends on age and health state
+#split on age first, then health prob
+split = res_fs.minimizer[1]
+guessed_bad_life_ceiling = res_fs.minimizer[2]
+df_h[!,:guess_type] = (df_h.h_prob .≥ split) .| (df_h.age .> guessed_bad_life_ceiling)
 pre_h = zeros(Union{Missing, Int64}, nrow(df_h))
 for i in 1:nrow(df_h) 
     pre_h[i] = (df_h.time[i] != 1 ? df_h[i-1,:health] : missing)
 end
-df_h.pre_health = pre_h
+df_h.pre_health =(pre_h .== 1)
 ldf_h = dropmissing(df_h)
-#simulated prior
+
+#initial point should be chosen s.t. the predicted life ceiling is greater. 
+function L_splited(x;df)
+    (; df,) = df
+    μ(a) = min(x[1]*exp(x[2]*a)+x[3],1.0)
+    #prob of sick
+    H(a, ph) = cdf(Logistic(), x[4]+x[5]*a+x[6]*(ph==0))
+    pre_h = zeros(Union{Missing, Int64}, nrow(df))
+    for i in 1:nrow(df) 
+        pre_h[i] = (df.time[i] != 1 ? df[i-1,:health] : missing)
+    end
+    df.pre_health =(pre_h .== 1)
+    ldf = dropmissing(df)
+    
+    @tullio l_μ[i] := (μ(df.age[i])>0.0 ? log(μ(df.age[i]))*df.die[i] + log(1-μ(df.age[i]))*(1 - df.die[i]) : -1e20)
+    @tullio l_H[i] := log(H(ldf.age[i],ldf.pre_health[i]))*(1-ldf.health[i]) + log(1-H(ldf.age[i],ldf.pre_health[i]))* ldf.health[i]
+    return sum(l_μ)+sum(l_H)
+end
+healthy_df = filter(row -> row.guess_type == 1, df_h)
+df = @with_kw (df = healthy_df,)
+h_df = df()
+unhealthy_df = filter(row -> row.guess_type == 0, df_h)
+udf = @with_kw (df = unhealthy_df,)
+uh_df = udf()
+x = [0.0001,0.06,0.0001,-40.0,0.2,0.3]
+
+L_splited(x;df = h_df)
+res_healthy = optimize(x -> -L_splited(x; df = h_df), x)
+L_splited(res_healthy.minimizer;df = h_df)
+res_healthy.minimizer
+plt = plot(gm(res_healthy.minimizer[1:3]).dp, label = L"̂μ_1")
+plot!(gm1.dp, label = L"μ_1*")
+plot!(65:99, combine(groupby(healthy_df,:age), :die => mean).die_mean, label = L"μ_1")
+L_splited(x;df = uh_df)
+res_unhealthy = optimize(x -> -L_splited(x; df = uh_df), x)
+L_splited(res_unhealthy.minimizer;df = h_df)
+res_unhealthy.minimizer
+plot(gm(res_unhealthy.minimizer[1:3]).dp, label = L"̂μ_0")
+plot!(gm0.dp, label = L"μ_0*")
+plot!(65:(64+length(combine(groupby(unhealthy_df,:age), :die => mean).die_mean)), combine(groupby(unhealthy_df,:age), :die => mean).die_mean, label = L"μ_0")
+
+function L_combined(θ)
+    split = θ[1]
+    guessed_bad_life_ceiling = θ[2]
+    df_h[!,:guess_type] = (df_h.h_prob .≥ split) .| (df_h.age .> guessed_bad_life_ceiling)
+    pre_h = zeros(Union{Missing, Int64}, nrow(df_h))
+    for i in 1:nrow(df_h) 
+        pre_h[i] = (df_h.time[i] != 1 ? df_h[i-1,:health] : missing)
+    end
+    df_h.pre_health =(pre_h .== 1)
+    ldf_h = dropmissing(df_h)
+    healthy_df = filter(row -> row.guess_type == 1, df_h)
+    df = @with_kw (df = healthy_df,)
+    h_df = df()
+    unhealthy_df = filter(row -> row.guess_type == 0, df_h)
+    udf = @with_kw (df = unhealthy_df,)
+    uh_df = udf()
+
+    res_healthy = optimize(x -> -L_splited(x; df = h_df), [0.0001,0.06,0.0001,-40.0,0.2,0.3])
+    res_unhealthy = optimize(x -> -L_splited(x; df = uh_df), [0.0001,0.06,0.0001,-40.0,0.2,0.3])
+    return L_splited(res_healthy.minimizer; df = h_df)+L_splited(res_unhealthy.minimizer; df = uh_df)
+end 
+
+res_fs = optimize(θ -> -L_combined(θ), [0.5,85])
+res_fs.minimizer
+
 #MLE in first stage
 #adjust to logit
 #x[1:3]: type 0 Mortality
@@ -102,54 +180,7 @@ ldf_h = dropmissing(df_h)
 #x[6:8]: type 0 Health transition logit
 #x[9:11]: type 1 Health transition logit
 #x[12]: age 65 type 1 proportion
-function L_fs(x)
-    μ0(a) = min(x[1]*exp(x[2]*a)+x[3],1.0)
-    μ1(a) = min(x[4]*exp(x[5]*a)+x[3],1.0)
-    H0(a, ph) = cdf(Logistic(), x[6]+x[7]*a+x[8]*(ph==0))
-    H1(a, ph) = cdf(Logistic(), x[9]+x[10]*a+x[11]*(ph==0))
-    #adjust time by ourselves
-    s = fill(x[12], maximum(df_h.age)-64)
-    for a in 2:length(s)
-        s[a] = s[a-1]*(1-μ1(a+63))/(s[a-1]*(1-μ1(a+63))+(1-s[a-1])*(1-μ0(a+63)))
-    end
-    #need some speed here
-    loglikelihood = 0
-    for i in 1:length(df_h.id)
-        loglikelihood = loglikelihood + ((s[df_h.age[i]-64]*μ1(df_h.age[i])+(1-s[df_h.age[i]-64])*μ0(df_h.age[i]) < 1.0) && (s[df_h.age[i]-64]*μ1(df_h.age[i])+(1-s[df_h.age[i]-64])*μ0(df_h.age[i]) > 0.0) ? log(s[df_h.age[i]-64]*μ1(df_h.age[i])+(1-s[df_h.age[i]-64])*μ0(df_h.age[i]))*df_h.die[i]+log(1-(s[df_h.age[i]-64]*μ1(df_h.age[i])+(1-s[df_h.age[i]-64])*μ0(df_h.age[i])))*(1-df_h.die[i]) : -1e20)
-    end
-    
-    for i in 1:length(ldf_h.id)
-        loglikelihood = loglikelihood + ((s[ldf_h.age[i]-64]*H1(ldf_h.age[i],ldf_h.pre_health[i])+(1-s[ldf_h.age[i]-64])*H0(ldf_h.age[i],ldf_h.pre_health[i]) < 1.0) && (s[ldf_h.age[i]-64]*H1(ldf_h.age[i],ldf_h.pre_health[i])+(1-s[ldf_h.age[i]-64])*H0(ldf_h.age[i],ldf_h.pre_health[i]) > 0.0) ? log(s[ldf_h.age[i]-64]*H1(ldf_h.age[i],ldf_h.pre_health[i])+(1-s[ldf_h.age[i]-64])*H0(ldf_h.age[i],ldf_h.pre_health[i]))*(1-ldf_h.health[i])+log(1-(s[ldf_h.age[i]-64]*H1(ldf_h.age[i],ldf_h.pre_health[i])+(1-s[ldf_h.age[i]-64])*H0(ldf_h.age[i],ldf_h.pre_health[i])))*ldf_h.health[i] : -1e20)
-    end
-    
-    return loglikelihood
-end
-L_fs(0.001*ones(12))
-plot(65:99, s[65:end])
 
-
-res_mle_fs = optimize(x -> -L_fs(x), 0.001*ones(12)) 
-println(res_mle_fs.minimizer)
-L_fs(res_mle_fs.minimizer)
-x̂ = res_mle_fs.minimizer
-#may be the problem of likelihood functions
-gm0_mle = gm(res_mle_fs.minimizer[1:3])
-gm1_mle1 = gm([res_mle_fs.minimizer[4],res_mle_fs.minimizer[5],res_mle_fs.minimizer[3]])
-
-ForwardDiff.gradient(L_fs,[0.002,0.075,0.001,0.001,0.07,0.7,0.4,0.3,0.1,0.3])
-ForwardDiff.gradient(L_fs,res_mle_fs.minimizer)
-
-plot(65:99, x -> min(x̂[1]*exp(x̂[2]*x)+x̂[3],1.0), label = L"̂μ_0")
-plot!(65:99, x -> min(0.002*exp(0.075*x)+0.001,1.0), label = L"μ^*_0")
-plot!(65:99, x -> min(x̂[4]*exp(x̂[5]*x)+x̂[3],1.0), label = L"̂μ_1")
-plot!(65:99, x -> min(0.001*exp(0.07*x)+0.001,1.0), label = L"μ^*_1")
-s0 = fill(x̂[10], length(gm1_mle.dp))
-gm0_mle_ex = vcat(gm0_mle.dp,ones(length(gm1_mle.dp)-length(gm0_mle.dp)))
-for a in 2:length(s0)
-    s0[a] = s0[a-1]*(1-gm1_mle.dp[a-1])/(s0[a-1]*(1-gm1_mle.dp[a-1])+(1-s0[a-1])*(1-gm0_mle_ex[a-1]))
-end
-plot(65:99,s0[65:99],label = L"ŝ")
-plot!(65:99,s[65:99],label = L"s")
 
 #model solver
 gm0_aug = zeros(size(gm1.dist))
