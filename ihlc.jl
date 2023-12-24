@@ -4,7 +4,7 @@ using LinearAlgebra, Parameters, Random, LaTeXStrings, Expectations
 using CUDA, CUDAKernels, KernelAbstractions, Tullio
 using Optim, ForwardDiff, Roots, DataFrames, KernelDensity
 using MortalityTables, Distances, Statistics, QuantEcon
-using Optimization, OptimizationOptimJL
+using Optimization, OptimizationOptimJL, Tables, Colors
 
 function gm(x)
     m = Makeham(x[1], x[2], x[3])
@@ -20,178 +20,40 @@ function gm(x)
     return (ceiling = Tm, dist = dist, dp = μ[1:end-1])
 end
 
-
 gm0 = gm([0.001,0.075,0.001])
 gm1 = gm([0.001,0.07,0.001])
+gm0_aug = zeros(size(gm1.dist))
+gm0_aug[1:gm0.ceiling+1, 1:gm0.ceiling+1] = gm0.dist
+gm0_aug[1,gm0.ceiling+1:end-1] .= 1.0
 #prob. of getting sick 
 H0(a, ph) = cdf(Logistic(), -38.0+0.5*a+2.0*(ph==0))
 H1(a, ph) = cdf(Logistic(), -32.0+0.4*a+0.5*(ph==0))
 
-plot(65:99, x -> cdf(Logistic(), -32.0+0.4*x))
-plot!(65:99, x -> cdf(Logistic(), -38.0+0.5*x))
-plot!(65:99, x -> cdf(Logistic(), -31.5+0.4*x))
-plot!(65:99, x -> cdf(Logistic(), -36.0+0.5*x))
 
 #simulation parameters
-N = 10000
-periods = 10
+N = 30000
+periods = length(gm1.dp)-64
 
-type = zeros(Bool, N)
-ages = zeros(Int64, N, periods)
-die = zeros(Bool, N, periods)
-health = zeros(Union{Missing, Int64}, N, periods)
+γ = 0.7
+μ_y = 5.0
+s_y = 0.3
+r = 0.02
+α = 6.0
+β = 0.95
+κ = 10.0
+δ = 0.5
+Random.seed!(123)
+ε_y = s_y*randn(250)
 
-#type percentage (real prior for being helthy)
-s = fill(0.3, length(gm1.dp)-64)
-gm0_ex = vcat(gm0.dp,ones(length(gm1.dp)-length(gm0.dp)))
-for a in 2:length(s)
-    s[a] = (gm0_ex[a+63] != 1.0 ? s[a-1]*(1-gm1.dp[a+63])/(s[a-1]*(1-gm1.dp[a+63])+(1-s[a-1])*(1-gm0_ex[a+63])) : 1.0)
-end
-#assume that the age dist. is DiscreteUniform -- does not really matter.
-@tullio ages[i,1] = rand(DiscreteUniform(65, $gm1.ceiling))
-#0:unhealthy 1:healthy
-type = rand.(Bernoulli.(s[ages[:,1].-64]))
-for j in 2:periods
-    ages[:,j] = ages[:,j-1] .+ 1
-end
-#draw whether each person dies or not
-for i in 1:N
-    die[i,1] = (type[i] == 0 ? rand(Bernoulli(gm0.dp[ages[i,1]])) : rand(Bernoulli(gm1.dp[ages[i,1]])))
-end
-for j in 2:periods
-    for i in 1:N
-        if type[i] == 0
-            die[i,j] = (sum(die[i,1:j-1]) == 0 ? rand(Bernoulli(gm0.dp[ages[i,j]])) : 0)
-        else
-            die[i,j] = (sum(die[i,1:j-1]) == 0 ? rand(Bernoulli(gm1.dp[ages[i,j]])) : 0)
-        end
-    end
-end
-#draw the health status at each periods
+β_H0 = [-38.0,0.5,2.0]
+β_H1 = [-32.0,0.4,0.5]
 
-@tullio health[i,1] = rand(Bernoulli(0.5))
-for t in 2:periods
-    @tullio health[i,$t] = (type[i] == 0 ? rand(Bernoulli(1-H0(ages[i,$t], health[i,$t-1]))) : rand(Bernoulli(1-H1(ages[i,$t], health[i,$t-1]))))
-end
-for j in 2:periods
-    for i in 1:N
-        health[i,j] = (sum(die[i,1:j-1]) ==0 ? health[i,j] : missing)
-    end
-end 
-
-df = DataFrame(id = vec(repeat(transpose(collect(1:N)),periods)), 
-                time = repeat(collect(1:10),N), age = vec(transpose(ages)),
-                die = vec(transpose(die)), health = (vec(transpose(health)) .== 1))
-
-#μ0 = x[1]*exp(x[2]*t)+x[3]; μ1 = x[4]*exp(x[5]*t)+x[6]
-#H_1 = [x[7], x[8];1-x[7], 1-x[8]]; ht2 = [x[9], x[10];1-x[9]x[10],1-x[10]]
-#s1 = x[11] :type healthy
-df_h = filter(row -> !ismissing(row.health), df)
-dt = combine(groupby(df_h, :id), nrow, :health => mean)
-health_prob = zeros(nrow(df_h))
-step = 1
-for i in 1:nrow(dt)
-    h_prob = fill(dt.health_mean[i],dt.nrow[i])
-    health_prob[step:step + dt.nrow[i]-1] = h_prob
-    step = step + dt.nrow[i]
-end
-df_h[!,:h_prob] = health_prob
-#should depends on age and health state
-#split on age first, then health prob
-split = res_fs.minimizer[1]
-guessed_bad_life_ceiling = res_fs.minimizer[2]
-df_h[!,:guess_type] = (df_h.h_prob .≥ split) .| (df_h.age .> guessed_bad_life_ceiling)
-pre_h = zeros(Union{Missing, Int64}, nrow(df_h))
-for i in 1:nrow(df_h) 
-    pre_h[i] = (df_h.time[i] != 1 ? df_h[i-1,:health] : missing)
-end
-df_h.pre_health =(pre_h .== 1)
-ldf_h = dropmissing(df_h)
-
-#initial point should be chosen s.t. the predicted life ceiling is greater. 
-function L_splited(x;df)
-    (; df,) = df
-    μ(a) = min(x[1]*exp(x[2]*a)+x[3],1.0)
-    #prob of sick
-    H(a, ph) = cdf(Logistic(), x[4]+x[5]*a+x[6]*(ph==0))
-    pre_h = zeros(Union{Missing, Int64}, nrow(df))
-    for i in 1:nrow(df) 
-        pre_h[i] = (df.time[i] != 1 ? df[i-1,:health] : missing)
-    end
-    df.pre_health =(pre_h .== 1)
-    ldf = dropmissing(df)
-    
-    @tullio l_μ[i] := (μ(df.age[i])>0.0 ? log(μ(df.age[i]))*df.die[i] + log(1-μ(df.age[i]))*(1 - df.die[i]) : -1e20)
-    @tullio l_H[i] := log(H(ldf.age[i],ldf.pre_health[i]))*(1-ldf.health[i]) + log(1-H(ldf.age[i],ldf.pre_health[i]))* ldf.health[i]
-    return sum(l_μ)+sum(l_H)
-end
-healthy_df = filter(row -> row.guess_type == 1, df_h)
-df = @with_kw (df = healthy_df,)
-h_df = df()
-unhealthy_df = filter(row -> row.guess_type == 0, df_h)
-udf = @with_kw (df = unhealthy_df,)
-uh_df = udf()
-x = [0.0001,0.06,0.0001,-40.0,0.2,0.3]
-
-L_splited(x;df = h_df)
-res_healthy = optimize(x -> -L_splited(x; df = h_df), x)
-L_splited(res_healthy.minimizer;df = h_df)
-res_healthy.minimizer
-plt = plot(gm(res_healthy.minimizer[1:3]).dp, label = L"̂μ_1")
-plot!(gm1.dp, label = L"μ_1*")
-plot!(65:99, combine(groupby(healthy_df,:age), :die => mean).die_mean, label = L"μ_1")
-L_splited(x;df = uh_df)
-res_unhealthy = optimize(x -> -L_splited(x; df = uh_df), x)
-L_splited(res_unhealthy.minimizer;df = h_df)
-res_unhealthy.minimizer
-plot(gm(res_unhealthy.minimizer[1:3]).dp, label = L"̂μ_0")
-plot!(gm0.dp, label = L"μ_0*")
-plot!(65:(64+length(combine(groupby(unhealthy_df,:age), :die => mean).die_mean)), combine(groupby(unhealthy_df,:age), :die => mean).die_mean, label = L"μ_0")
-
-function L_combined(θ)
-    split = θ[1]
-    guessed_bad_life_ceiling = θ[2]
-    df_h[!,:guess_type] = (df_h.h_prob .≥ split) .| (df_h.age .> guessed_bad_life_ceiling)
-    pre_h = zeros(Union{Missing, Int64}, nrow(df_h))
-    for i in 1:nrow(df_h) 
-        pre_h[i] = (df_h.time[i] != 1 ? df_h[i-1,:health] : missing)
-    end
-    df_h.pre_health =(pre_h .== 1)
-    ldf_h = dropmissing(df_h)
-    healthy_df = filter(row -> row.guess_type == 1, df_h)
-    df = @with_kw (df = healthy_df,)
-    h_df = df()
-    unhealthy_df = filter(row -> row.guess_type == 0, df_h)
-    udf = @with_kw (df = unhealthy_df,)
-    uh_df = udf()
-
-    res_healthy = optimize(x -> -L_splited(x; df = h_df), [0.0001,0.06,0.0001,-40.0,0.2,0.3])
-    res_unhealthy = optimize(x -> -L_splited(x; df = uh_df), [0.0001,0.06,0.0001,-40.0,0.2,0.3])
-    return L_splited(res_healthy.minimizer; df = h_df)+L_splited(res_unhealthy.minimizer; df = uh_df)
-end 
-
-res_fs = optimize(θ -> -L_combined(θ), [0.5,85])
-res_fs.minimizer
-
-#MLE in first stage
-#adjust to logit
-#x[1:3]: type 0 Mortality
-#x[4:5]: type 1 Mortality (θ_13 = x[3])
-#x[6:8]: type 0 Health transition logit
-#x[9:11]: type 1 Health transition logit
-#x[12]: age 65 type 1 proportion
-
-
-#model solver
-gm0_aug = zeros(size(gm1.dist))
-gm0_aug[1:gm0.ceiling+1, 1:gm0.ceiling+1] = gm0.dist
-gm0_aug[1,gm0.ceiling+1:end-1] .= 1.0
-
-ihlc = @with_kw (γ = 0.7, μ_y = 5.0, s_y = 0.3, ε_y = s_y*randn(250), r = 0.02, 
-                α = 5.0, β = 0.95, κ = 10.0, δ = 0.5, gm0 = gm0, gm1 = gm1, 
-                β_H0 = [-38.0,0.5,2.0], β_H1 = [-32.0,0.4,0.5])
+ihlc = @with_kw (γ = γ, μ_y = μ_y, s_y = s_y, ε_y = ε_y, r = r, 
+                α = α, β = β, κ = κ, δ = δ, gm0 = gm0, gm1 = gm1, 
+                β_H0 = β_H0, β_H1 = β_H1)
 ihlc = ihlc()
 
+#model solver
 
 function backward_solve(ihlc)
     (;γ, μ_y, s_y, ε_y, r, α, β, κ, δ, gm0, gm1, β_H0, β_H1) = ihlc
@@ -203,8 +65,9 @@ function backward_solve(ihlc)
     H1(a, ph) = cdf(Logistic(), β_H1[1] + β_H1[2]*a + β_H1[3]*(ph==1))
 
     #state variables
-    y = range(μ_y+minimum(ε_y), μ_y+maximum(ε_y), length = 21)
-    b = range(-κ+1e-5, 30, 51)
+    #y need to be adjust by ourselves
+    y = range(3, 7, length = 21)
+    b = range(-κ+1e-5, 30, 101)
     h = [1-δ,1]
     a = 65:life_ceil
     s = 0.0:0.05:1.0
@@ -267,49 +130,301 @@ function backward_solve(ihlc)
 end
 
 sol = backward_solve(ihlc)
-npsc = Array(sol.NPSC)
-findall(x -> (x ≈ 1.0), sum(sol.D, dims = 2))#dist need to be adjusted
-heatmap(sol.σ[:,:,1,22,end])
-heatmap(Array(sol.D)[:,:,1])
-heatmap(sign.(npsc[:,:,24]))
 
-y = ihlc.μ_y .+ ihlc.s_y*randn(ihlc.gm1.ceiling-64)
-y = fill(ihlc.μ_y,ihlc.gm1.ceiling-64)
-bon = zeros(ihlc.gm1.ceiling-63)
-con = similar(y)
-h = fill(1,length(y))
-for t in 2:length(y)
-    h[t] = rand(Bernoulli(1-H0(64+t,h[t-1])))
-end
-s = fill(0.3,ihlc.gm1.ceiling-63)
-
-σ_func = LinearInterpolation((range(ihlc.μ_y+minimum(ihlc.ε_y), ihlc.μ_y+maximum(ihlc.ε_y), length = 21),
-                                range(-ihlc.κ+1e-5, ihlc.μ_y*(1+ihlc.r)/ihlc.r, 51), 0:1, 65:ihlc.gm1.ceiling+1,
+σ_func = LinearInterpolation((range(3, 7, length = 21), range(-ihlc.κ+1e-5, 30, 101), 
+                                0:1, 65:ihlc.gm1.ceiling+1,
                                 0.0:0.05:1.0), sol.σ)
-v_func = LinearInterpolation((range(ihlc.μ_y+minimum(ihlc.ε_y), ihlc.μ_y+maximum(ihlc.ε_y), length = 21),
-range(-ihlc.κ+1e-5, ihlc.μ_y*(1+ihlc.r)/ihlc.r, 51), 0:1, 65:ihlc.gm1.ceiling+1,
-0.0:0.05:1.0), sol.v)
-v_func(y[1],0,1,65,0.3)
-v_func(y[35],-9,0,86,0.1)
+
+type = zeros(Bool, N)
+ages = zeros(Int64, N, periods)
+die = zeros(Bool, N, periods)
+health = zeros(Union{Missing, Int64}, N, periods)
+Random.seed!(123)
+y = μ_y .+ s_y*randn(N,periods)
+
+#type percentage (real prior for being helthy)
+s = fill(0.3, length(gm1.dp))
+gm0_ex = vcat(gm0.dp,ones(length(gm1.dp)-length(gm0.dp)))
+for a in 2:length(s)
+    s[a] = (gm0_ex[a] != 1.0 ? s[a-1]*(1-gm1.dp[a])/(s[a-1]*(1-gm1.dp[a])+(1-s[a-1])*(1-gm0_ex[a])) : 1.0)
+end
+
+
+#draw ages
+Random.seed!(123)
+@tullio ages[i,1] = 65
+for j in 2:periods
+    @tullio ages[i,$j] = ages[i,$j-1] + 1
+end
+#type: 0:unhealthy 1:healthy
+Random.seed!(123)
+type = rand.(Bernoulli.(s[ages[:,1]]))
+#draw whether each person dies or not
+Random.seed!(123)
+for i in 1:N
+    die[i,1] = (type[i] == 0 ? rand(Bernoulli(gm0.dp[ages[i,1]])) : rand(Bernoulli(gm1.dp[ages[i,1]])))
+end
+Random.seed!(123)
+for j in 2:periods
+    for i in 1:N
+        if type[i] == 0
+            die[i,j] = (sum(die[i,1:j-1]) == 0 ? rand(Bernoulli(gm0.dp[ages[i,j]])) : 0)
+        else
+            die[i,j] = (sum(die[i,1:j-1]) == 0 ? rand(Bernoulli(gm1.dp[ages[i,j]])) : 0)
+        end
+    end
+end
+#draw the health status at each periods
+Random.seed!(123)
+@tullio health[i,1] = rand(Bernoulli(0.5))
+Random.seed!(123)
+for t in 2:periods
+    @tullio health[i,$t] = (type[i] == 0 ? rand(Bernoulli(1-H0(ages[i,$t], health[i,$t-1]))) : rand(Bernoulli(1-H1(ages[i,$t], health[i,$t-1]))))
+end
+for j in 2:periods
+    for i in 1:N
+        health[i,j] = (sum(die[i,1:j-1]) ==0 ? health[i,j] : missing)
+    end
+end 
+#b_0
+assets = zeros(N,periods+1)
+Random.seed!(123)
+assets_0 = 10.0 .+ 2.0*randn(N)
+#individual priors
+Random.seed!(123)
+priors = rand(Beta(2.0,2.0), N, periods+1)
+for i in 1:N
+    for t in 1:periods
+        assets[i,1+ t] = (!ismissing(health[i, t]) ? σ_func(y[i, t], assets[i, t], health[i, t], ages[i, t], priors[i, t]) : 0)
+        if t != periods && ages[i,t] ≤ length(gm1.dp)
+            priors[i,(1+t)] = (!ismissing(health[i, (1+t)]) ? (health[i, (1+t)] == 0 ? priors[i,t]*H1(ages[i,t],health[i,t])/(priors[i,t]*H1(ages[i,t],health[i,t])+(1-priors[i,t])*H0(ages[i,t],health[i,t])) : priors[i,t]*(1-H1(ages[i,t],health[i,t]))/(priors[i,t]*(1-H1(ages[i,t],health[i,t]))+(1-priors[i,t])*(1-H0(ages[i,t],health[i,t])))) : 0.5)
+            priors[i,(1+t)] = (ihlc.gm1.dp[ages[i,t]] != 1 ? priors[i,(t+1)]*(1-ihlc.gm1.dp[ages[i,t]])/(priors[i,(t+1)]*(1-ihlc.gm1.dp[ages[i,t]])+(1-priors[i,(t+1)])*(1-gm0_ex[ages[i,t]])) : 1.0)
+        end
+    end
+end
+#=
+for i in 1:N
+    for t in 1:periods
+        assets[i,1+ t] = (!ismissing(health[i, t]) ? σ_func(y[i, t], assets[i, t], health[i, t], ages[i, t], priors[i, t]) : 0)
+        if t != periods && ages[i,t] < 100
+            priors[i,(1+t)] = (!ismissing(health[i, (1+t)]) ? (health[i, (1+t)] == 0 ? priors[i,t]*H1(ages[i,t],health[i,t])/(priors[i,t]*H1(ages[i,t],health[i,t])+(1-priors[i,t])*H0(ages[i,t],health[i,t])) : priors[i,t]*(1-H1(ages[i,t],health[i,t]))/(priors[i,t]*(1-H1(ages[i,t],health[i,t]))+(1-priors[i,t])*(1-H0(ages[i,t],health[i,t])))) : 0.5)
+            priors[i,(1+t)] = (ihlc.gm1.dp[ages[i,t]] != 1 ? priors[i,(t+1)]*(1-ihlc.gm1.dp[ages[i,t]])/(priors[i,(t+1)]*(1-ihlc.gm1.dp[ages[i,t]])+(1-priors[i,(t+1)])*(1-gm0_ex[ages[i,t]])) : 1.0)
+        end
+    end
+end
+=#
+
+df = DataFrame(id = vec(repeat(transpose(collect(1:N)),periods)), 
+                time = repeat(collect(1:periods),N), age = vec(transpose(ages)),
+                die = vec(transpose(die)), health = (vec(transpose(health)) .== 1),
+                income = vec(y), assets = vec(assets[:,2:end]), pre_assets = vec(assets[:,1:end-1]),
+                consumption = vec(y + (1+r)*assets[:,1:end-1] - assets[:,2:end]))
+dropmissing!(df)
+maximum(df.age)
+filter(row -> row.age == 91, df)
+#simulation
+vals = range(1.0, 20.0, length = 11)
+ass_mean_trials = zeros(periods,length(vals))
+for j in 1:length(vals)
+    ihlc = @with_kw (γ = γ, μ_y = μ_y, s_y = s_y, ε_y = ε_y, r = r, 
+                α = α, β = β, κ = vals[j], δ = δ, gm0 = gm0, gm1 = gm1, 
+                β_H0 = β_H0, β_H1 = β_H1)
+    ihlc = ihlc()
+    sol = backward_solve(ihlc)
+    σ_func = LinearInterpolation((range(3, 7, length = 21), range(-ihlc.κ+1e-5, 30, 101), 
+                                0:1, 65:ihlc.gm1.ceiling+1,
+                                0.0:0.05:1.0), sol.σ)
+    assets = zeros(N,periods+1)
+    assets[:,1] = assets_0
+    for t in 1:periods
+        for i in 1:N
+            assets[i,1+t] = (!ismissing(health[i, t]) ? σ_func(y[i, t], assets[i, t], health[i, t], ages[i, t], priors[i, t]) : 0)
+        end
+    end
+    df = DataFrame(id = vec(repeat(transpose(collect(1:N)),periods)), 
+                time = repeat(collect(1:periods),N), age = vec(transpose(ages)),
+                die = vec(transpose(die)), health = (vec(transpose(health)) .== 1),
+                income = vec(y), assets = vec(assets[:,2:end]), pre_assets = vec(assets[:,1:end-1]),
+                consumption = vec(y + (1+r)*assets[:,1:end-1] - assets[:,2:end]))
+    dropmissing!(df)
+    gd = groupby(df, :age)
+    for t in 1:length(gd)
+        ass_mean_trials[t,j] = mean(gd[t].assets)
+    end
+end
+plt = plot()
+for i in 1:length(vals)
+    plot!(65:91, ass_mean_trials[1:91-65+1,i], color = RGBA(i/length(vals),0,1-i/length(vals),0.8), linewidth = 2.0, label = "")
+end
+title!("Asset")
+xlabel!("age")
+savefig(plt, "kappa_plt.png")
+#μ0 = x[1]*exp(x[2]*t)+x[3]; μ1 = x[4]*exp(x[5]*t)+x[6]
+#H_1 = [x[7], x[8];1-x[7], 1-x[8]]; ht2 = [x[9], x[10];1-x[9]x[10],1-x[10]]
+#s1 = x[11] :type healthy
+df_h = filter(row -> !ismissing(row.health), df)
+#view the data
+vscodedisplay(df_h)
+dt = combine(groupby(df_h, :id), nrow, :health => mean, :age => minimum)
+health_prob = zeros(nrow(df_h))
+age_minimum = similar(health_prob)
+step = 1
+for i in 1:nrow(dt)
+    health_prob[step:step + dt.nrow[i]-1] = fill(dt.health_mean[i],dt.nrow[i])
+    age_minimum[step:step + dt.nrow[i]-1] = fill(dt.age_minimum[i],dt.nrow[i])
+    step = step + dt.nrow[i]
+end
+df_h[!,:h_prob] = health_prob
+df_h[!,:first_obs_age] = convert.(Int, age_minimum)
+gd = groupby(df, :age)
+gd[end]
+mean_assets = zeros(length(gd))
+median_assets = zeros(size(mean_assets))
+ass_lb = zeros(size(mean_assets))
+ass_ub = zeros(size(mean_assets))
+ass_min = zeros(size(mean_assets))
+ass_max = zeros(size(mean_assets))
+ass_var = zeros(size(mean_assets))
+for t in 1:length(gd)
+    median_assets[t] = quantile(gd[t].assets, 0.5)
+    mean_assets[t] = mean(gd[t].assets)
+    ass_lb[t] = quantile(gd[t].assets, 0.025)
+    ass_ub[t] = quantile(gd[t].assets, 0.975)
+    ass_min[t] = minimum(gd[t].assets)
+    ass_max[t] = maximum(gd[t].assets)
+    ass_var[t] = var(gd[t].assets)
+end
+plt = plot(65:64+length(gd), mean_assets, color = :blue, label = "mean")
+plot!(65:64+length(gd), ass_ub, label = "", color = :black, linestyle = :dash)
+plot!(65:64+length(gd), ass_lb, label = "", color = :black, linestyle = :dash, fillrange = ass_ub, fillalpha = 0.2)
+title!("Assets")
+xlabel!("Age")
+plt = plot(65:64+length(gd), x -> nrow(gd[x-64]), label = "obs.")
+xlabel!("Age")
+savefig(plt, "demographics.png")
+plt = plot(65:64+length(gd), x -> 1-mean(gd[x-64].health), label = "Sick prob.")
+savefig(plt, "sick_prob.png")
+#should depends on age and health state
+#split on age first, then health prob
+split = res_fs.minimizer[1]
+guessed_bad_life_ceiling = res_fs.minimizer[2]
+df_h[!,:guess_type] = (df_h.h_prob .≥ split) .| (df_h.age .> guessed_bad_life_ceiling)
+pre_h = zeros(Union{Missing, Int64}, nrow(df_h))
+for i in 1:nrow(df_h) 
+    pre_h[i] = (df_h.time[i] != 1 ? df_h[i-1,:health] : missing)
+end
+df_h.pre_health =(pre_h .== 1)
+ldf_h = dropmissing(df_h)
+
+#initial point should be chosen s.t. the predicted life ceiling is greater. 
+#can possibly separate H and μ
+function L_splited(x;df)
+    (; df,) = df
+    μ(a) = min(x[1]*exp(x[2]*a)+x[3],1.0)
+    #prob of sick
+    H(a, ph) = cdf(Logistic(), x[4]+x[5]*a+x[6]*(ph==0))
+    pre_h = zeros(Union{Missing, Int64}, nrow(df))
+    for i in 1:nrow(df) 
+        pre_h[i] = ((df.time[i] != 1 || i > 1) ? df.health[i-1] : missing)
+    end
+    df.pre_health = (pre_h .== 1)
+    ldf = dropmissing(df)
+    
+    @tullio l_μ[i] := (μ(df.age[i])>0.0 ? log(μ(df.age[i]))*df.die[i] + log(1-μ(df.age[i]))*(1 - df.die[i]) : -1e20)
+    @tullio l_H[i] := log(H(ldf.age[i],ldf.pre_health[i]))*(1-ldf.health[i]) + log(1-H(ldf.age[i],ldf.pre_health[i]))* ldf.health[i]
+    return sum(l_μ)+sum(l_H)
+end
+healthy_df = filter(row -> row.guess_type == 1, df_h)
+df = @with_kw (df = healthy_df,)
+h_df = df()
+unhealthy_df = filter(row -> row.guess_type == 0, df_h)
+udf = @with_kw (df = unhealthy_df,)
+uh_df = udf()
+x = [0.0001,0.05,0.0001,-40.0,0.2,0.3]
+
+L_splited(x;df = h_df)
+res_healthy = optimize(x -> -L_splited(x; df = h_df), x)
+L_splited(res_healthy.minimizer;df = h_df)
+res_healthy.minimizer
+plt = plot(gm(res_healthy.minimizer[1:3]).dp, label = L"̂μ_1")
+plot!(gm1.dp, label = L"μ_1*")
+plot!(65:99, combine(groupby(healthy_df,:age), :die => mean).die_mean, label = L"μ_1")
+L_splited(x;df = uh_df)
+res_unhealthy = optimize(x -> -L_splited(x; df = uh_df), x)
+L_splited(res_unhealthy.minimizer;df = h_df)
+res_unhealthy.minimizer
+plt = plot(gm(res_unhealthy.minimizer[1:3]).dp, label = L"̂μ_0")
+plot!(gm0.dp, label = L"μ_0*")
+plot!(65:(64+length(combine(groupby(unhealthy_df,:age), :die => mean).die_mean)), combine(groupby(unhealthy_df,:age), :die => mean).die_mean, label = L"μ_0")
+
+plt = plot(65:99, a -> cdf(Logistic(), res_unhealthy.minimizer[4]+res_unhealthy.minimizer[5]*a), label = L"H_0")
+plot!(65:99, a -> H0(a, 1), label = L"H_0*")
+title!(L"h_{t-1} = 1")
+
+plot!(65:99, a -> cdf(Logistic(), res_healthy.minimizer[4]+res_healthy.minimizer[5]*a), label = L"H_1")
+plot!(65:99, a -> H1(a, 1), label = L"H_1*")
+title!(L"h_{t-1} = 1")
+
+savefig(plt, "H.png")
+function L_combined(θ)
+    split = θ[1]
+    guessed_bad_life_ceiling = θ[end]
+    df_h[!,:guess_type] = (df_h.h_prob .≥ split) .| (df_h.age .> guessed_bad_life_ceiling)
+    healthy_df = filter(row -> row.guess_type == 1, df_h)
+    df = @with_kw (df = healthy_df,)
+    h_df = df()
+    unhealthy_df = filter(row -> row.guess_type == 0, df_h)
+    udf = @with_kw (df = unhealthy_df,)
+    uh_df = udf()
+
+    res_healthy = optimize(x -> -L_splited(x; df = h_df), [0.0001,0.06,0.0001,-40.0,0.2,0.3])
+    res_unhealthy = optimize(x -> -L_splited(x; df = uh_df), [0.0001,0.06,0.0001,-40.0,0.2,0.3])
+    return L_splited(res_healthy.minimizer; df = h_df)+L_splited(res_unhealthy.minimizer; df = uh_df)
+end 
+
+init_θ = [0.5,95]
+res_fs = optimize(θ -> -L_combined(θ), init_θ)
+res_fs.minimizer
+
+
+#SMM target moments
+#E(b|h),E(b|a)
+function SMM(θ)
+    para_SMM = @with_kw (γ = θ[1], μ_y = μ_y, s_y = s_y, ε_y = ε_y, r = r, 
+                        α = θ[2], β = β, κ = θ[3], δ = θ[4], gm0 = gm0, gm1 = gm1, 
+                        β_H0 = β_H0, β_H1 = β_H1)
+    para = para_SMM()
+
+    sol = backward_solve(para)
+
+    σ_func = LinearInterpolation((range(3, 7, length = 21), range(-ihlc.κ+1e-5, 30, 51), 
+                        0:1, 65:ihlc.gm1.ceiling+1, 0.0:0.05:1.0), sol.σ)
+    
+end
+
+#plotter
+bon = zeros(ihlc.gm1.ceiling-63)
+h = ones(size(bon))
+y = (μ_y .+ s_y*randn(35))
+s = fill(0.3,size(h))
 for t in 1:ihlc.gm1.ceiling-64
     bon[t+1] = σ_func(y[t], bon[t], h[t], 64+t, s[t])
-    s[t+1] = (h[t] == 0 ? s[t]*H1(64+t,h[t])/(s[t]*H1(64+t,h[t])+(1-s[t])*H0(64+t,h[t])) : s[t]*(1-H1(64+t,h[t]))/(s[t]*(1-H1(64+t,h[t]))+(1-s[t])*(1-H0(64+t,h[t]))))
+    h[t+1] = rand(Bernoulli(1-H0(64+t, h[t])))
+    s[t+1] = (h[t+1] == 0 ? s[t]*H1(64+t,h[t])/(s[t]*H1(64+t,h[t])+(1-s[t])*H0(64+t,h[t])) : s[t]*(1-H1(64+t,h[t]))/(s[t]*(1-H1(64+t,h[t]))+(1-s[t])*(1-H0(64+t,h[t]))))
     s[t+1] = (ihlc.gm1.dp[64+t] != 1 ? s[t+1]*(1-ihlc.gm1.dp[64+t])/(s[t+1]*(1-ihlc.gm1.dp[64+t])+(1-s[t+1])*(1-gm0_ex[64+t])) : 1.0)
 end
 con = y + (1+ihlc.r)*bon[1:end-1] - bon[2:end]
-D_func = LinearInterpolation((0.0:0.05:1.0,1:ihlc.gm1.ceiling-63,65:ihlc.gm1.ceiling+1),sol.D)
+
+
 
 plt = plot(65:ihlc.gm1.ceiling, y, label = L"y", legend = :topleft)
 plot!(65:ihlc.gm1.ceiling, bon[2:end], label = L"b")
 plot!(65:ihlc.gm1.ceiling, con, label = L"c")
-plot!(twinx(), 65:ihlc.gm1.ceiling, [s[1:end-1],x -> D_func(s[x-64],1,x)], label = [L"s" L"dp"] , legend = :topright, color = [:black :brown])
+plot!(twinx(), 65:ihlc.gm1.ceiling, s[1:end-1], label = L"s", legend = :topright, color = :black)
 vspan!(vcat(64 .+ findall(x -> x != 0, h[1:end-1]-h[2:end]),ihlc.gm1.ceiling).+ 0.5, 
         color = :gray, alpha = :0.4, label = "")
 
-plot(h)
-savefig(plt, "save_plt.png")
-
-
+savefig(plt, "plt.png")
 
 
 
